@@ -9,6 +9,9 @@ Experiments are done on RTX 2060.
 
 Iterration 1: 
 
+- Generation from initial lenght of 2016 tokens = ~1.5s
+
+
 ## Future Work
 
 - [ ] Combine the kernels

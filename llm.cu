@@ -23,7 +23,7 @@ const int block_size_vocab = 1024;
 const int Vocab_OG = 50257;
 const int Vocab = 50272;
 const int num_heads = 12;
-int num_new_tokens = 100;
+int num_new_tokens = 32;
 const int N_Layers = 12;
 
 // const int num_heads = 1;
@@ -620,11 +620,14 @@ int main(){
     t0 = clock();
 
     int N = 2048;
-    int N_tokens = 9;
-    int N_compute = ((N_tokens + 32 - 1)/32)*32;
-    // int N_compute = N;
+    // int N_tokens =  9;
+    // int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101}; // 257
 
-    int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101}; // 257
+    int N_tokens =  2012;
+    int text[N_tokens];
+    for(int i = 0; i < N_tokens; i++) text[i] = rand() %(Vocab_OG + 1);
+
+    int N_compute = ((N_tokens + 32 - 1)/32)*32;
 
     float *h_input, *h_output, *h_linear[N_Layers][4], *h_bias[N_Layers][4], *h_ln[N_Layers][4],
            *h_mlp1[N_Layers], *h_mlp_bias1[N_Layers], *h_mlp2[N_Layers], *h_mlp_bias2[N_Layers],
