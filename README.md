@@ -1,19 +1,19 @@
 # llm.cu
 
-GPT-2 small model from scratch in CUDA. All the kernels are written from scratch.
-
-Experiments are done on RTX 2060.
-
+- GPT-2 in CUDA
+- All the kernels are written from scratch
+- Experiments are done on RTX 2060
 
 ## Performance
 
-Iterration 1: 
+Time refers to generating 32 tokens starting from the 2016 till 2048 tokens.
 
-- Generation from initial lenght of 2016 tokens = ~1.5s
-
+Iteration 1: 48.5s
+Iteration 2: ?
 
 ## Future Work
 
+- [ ] Use 3D grid for the MultiHeadAttention
 - [ ] Combine the kernels
 - [ ] Add tests
 - [ ] Use Flash Attention

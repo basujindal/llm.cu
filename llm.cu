@@ -623,7 +623,7 @@ int main(){
     // int N_tokens =  9;
     // int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101}; // 257
 
-    int N_tokens =  2012;
+    int N_tokens =  2016;
     int text[N_tokens];
     for(int i = 0; i < N_tokens; i++) text[i] = rand() %(Vocab_OG + 1);
 
@@ -856,12 +856,15 @@ int main(){
       N_compute = ((N_tokens + 32 - 1)/32)*32;
 
       // Initialization timing
-      t1 = clock();
-      t1sum = ((double)(t1-t0))/CLOCKS_PER_SEC;
+      t1sum = ((double)(clock() - t0))/CLOCKS_PER_SEC;
       // printf("Time per token = %f seconds\n", t1sum);
       printf("%d, %f second\n ", *new_token, t1sum);
 
     }
+
+    printf("Time for %d tokens = %f seconds\n", N_tokens, ((double)(clock() - t1))/CLOCKS_PER_SEC);
+
     return 0;
+
 }
   
