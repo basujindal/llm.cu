@@ -22,6 +22,7 @@ const int block_size_linear = 768;
 const int block_size_vocab = 1024;
 const int Vocab_OG = 50257;
 const int Vocab = 50272;
+const int head_dim = 64;
 const int num_heads = 12;
 int num_new_tokens = 32;
 const int N_Layers = 12;
@@ -255,9 +256,7 @@ __global__ void add(float *A, float *B, int dim){
 
 }
 
-// scale<<<N, block_size>>>(d_QK, head_dim, N, head_dim);
-
-__global__ void scale(float *A, int N, int head_dim){
+__global__ void scale(float *A, int N){
 
     int idx = threadIdx.x;
 
@@ -314,32 +313,87 @@ __global__ void isnan_test(float *data, int width, int height){
     }
 }
 
-__global__ void matmul_mha_transpose(const float *A, const float *B, float *C, int height, int width, int dim, int head_dim, int head_num) {
+__global__ void matmul_mha_transpose(const float *A, const float *B, float *C, int height, int width, int dim, int head_num) {
 
-  // declare cache in shared memory
   __shared__ float As[block_size][block_size];
   __shared__ float Bs[block_size][block_size];
 
-  // if(threadIdx.x == 0 && threadIdx.y == 0) printf("head_num %d %d\n", blockIdx.x, blockIdx.y);
-
   int col = threadIdx.x+blockDim.x*blockIdx.x;
   int row = threadIdx.y+blockDim.y*blockIdx.y;
-  // printf("%d %d\n", row, col);
   
-
   if ((row < height) && (col < width)){
-    // if(row == 8 && col == 8) printf("final %d %d\n", row, col);
   
     float temp = 0;
     for (int i = 0; i < head_dim/block_size; i++) {
 
-      // Load data into shared memory
       As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x + head_dim*head_num)];
       Bs[threadIdx.y][threadIdx.x] = B[col*dim + (block_size*i + threadIdx.y + head_dim*head_num)];
 
       __syncthreads();
 
-      // Keep track of the running sum
+      for (int k = 0; k < block_size; k++)
+      	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+    
+      __syncthreads();
+    }
+    
+    C[row*width+col] = temp;
+  }
+}
+
+__global__ void matmul_mha_transpose_z(const float *A, const float *B, float *C[num_heads], int height, int width, int dim) {
+
+  __shared__ float As[block_size][block_size];
+  __shared__ float Bs[block_size][block_size];
+
+  int col = threadIdx.x + blockDim.x*blockIdx.x;
+
+  int row = threadIdx.y + blockDim.y*blockIdx.y;
+
+  int depth = threadIdx.z + blockDim.z*blockIdx.z;
+  
+  if ((row < height) && (col < width)){
+  
+    float temp = 0;
+    for (int i = 0; i < head_dim/block_size; i++) {
+
+      As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x + head_dim*depth)];
+      Bs[threadIdx.y][threadIdx.x] = B[col*dim + (block_size*i + threadIdx.y + head_dim*depth)];
+
+      __syncthreads();
+
+      for (int k = 0; k < block_size; k++)
+      	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+    
+      __syncthreads();
+    }
+
+    if(depth == 1) printf("Depth %d, row %d, col %d\n", depth, row, row*width+col);
+    
+    C[depth][row*width+col] = temp;
+  }
+  
+}
+
+
+__global__ void matmul_mha(const float *A, const float *B, float *C, int height, int width, int dim, int head_num) {
+
+  __shared__ float As[block_size][block_size];
+  __shared__ float Bs[block_size][block_size];
+
+  int row = threadIdx.y+blockDim.y*blockIdx.y;
+  int col = threadIdx.x+blockDim.x*blockIdx.x + head_dim*head_num;
+  
+  if ((row < height) && (col < width)){
+
+    float temp = 0;
+    for (int i = 0; i < dim/block_size; i++) {
+
+      As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x)];
+      Bs[threadIdx.y][threadIdx.x] = B[col + width*(block_size*i + threadIdx.y)];
+
+      __syncthreads();
+
       for (int k = 0; k < block_size; k++)
       	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x]; // dot product of row and column
     
@@ -348,46 +402,6 @@ __global__ void matmul_mha_transpose(const float *A, const float *B, float *C, i
     }
     
     C[row*width+col] = temp;
-  }
-}
-
-
-__global__ void matmul_mha(const float *A, const float *B, float *C, int height, int width, int dim, int head_dim, int head_num, int width_full ) {
-
-// N, head_dim, N, head_dim, i, Dim
-
-  // declare cache in shared memory
-  __shared__ float As[block_size][block_size];
-  __shared__ float Bs[block_size][block_size];
-
-  // As[threadIdx.y][threadIdx.x] = 0.0f;
-  // Bs[threadIdx.y][threadIdx.x] = 0.0f;
-
-  int row = threadIdx.y+blockDim.y*blockIdx.y;
-  int col = threadIdx.x+blockDim.x*blockIdx.x + head_dim*head_num;
-  // if(threadIdx.x == 0 && threadIdx.y == 0) printf("headnum, %d %d\n", row, head_dim*head_num);
-  
-  if ((row < height) && (col < width_full)){
-
-    float temp = 0;
-    for (int i = 0; i < dim/block_size; i++) {
-
-      // Load data into shared memory
-      As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x)];
-      Bs[threadIdx.y][threadIdx.x] = B[col + width_full*(block_size*i + threadIdx.y)];
-
-      __syncthreads();
-
-      // Keep track of the running sum
-      for (int k = 0; k < block_size; k++)
-      	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x]; // dot product of row and column
-    
-      __syncthreads();
-
-    }
-    // if(
-    //   threadIdx.x == 0 && threadIdx.y == 0 )printf("final %d %d %d\n", row*width_full, width_full,  col);
-    C[row*width_full+col] = temp;
   }
 }
 
@@ -401,10 +415,7 @@ __global__ void max_index(float *A, size_t height, size_t width, int *max_idx) {
   int start_index = blockIdx.x * width; // Start index for this block
   int end_index = start_index + width;  // End index for this block
 
-  // Find the maximum value in the block
-
   for (int index = start_index + idx; index < end_index; index += blockDim.x) {
-    // if(threadIdx.x == 0) printf("%d \n", index);
     if (index < height*width && A[index] > A[sdata[idx]]) sdata[idx] = index;
     
   }
@@ -428,7 +439,7 @@ __global__ void set_new_embedding(float *A, int dim, int N_tokens, float *emb, i
     
 }
 
-int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *d_act, float *d_act_wide,
+int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK[num_heads], float *d_act, float *d_act_wide,
       float *linear[4], float *bias[4], float *ln[], float *mlp1, float *mlp_bias1, float *mlp2, float *mlp_bias2,
       int Dim, int N, int N_tokens, float *h_output, float *d_act2, int N_compute){
 
@@ -456,44 +467,52 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_V, Dim, N);
 
-    int head_dim = Dim/num_heads;
     dim3 grid_mha((Dim + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size);
 
-    dim3 grid_mha_transpose((N_compute + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size);
+    dim3 threads_transpose(block_size, block_size, 1);
+    dim3 grid_mha_transpose((N_compute + threads_transpose.y - 1)/block_size, (N_compute + threads_transpose.x - 1)/block_size, num_heads);
+      
+    printf("QK\n"); 
+    matmul_mha_transpose_z<<<grid_mha_transpose, threads_transpose>>>(d_Q, d_K, d_QK, N_compute, N_compute, Dim);
+    cudaCheckErrors("kernel launch failure");
+    cudaDeviceSynchronize();
+    cudaCheckErrors("kernel launch failure");
+    // isnan_test<<<1, 1>>>(d_QK, N, N);
+
+    printf("QK_V\n");
+    cudaDeviceSynchronize();
 
     for (int i = 0; i < num_heads; i++){
-  
-      // printf("QK\n"); 
-      matmul_mha_transpose<<<grid_mha_transpose, threads>>>(d_Q, d_K, d_QK, N_compute, N_compute, Dim, head_dim, i);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
-      
+
+      printf("Head %d\n", i);
+      cudaDeviceSynchronize();
+
       // scale by sqrt(d_k)
       // printf("Scale\n");
-      scale<<<N, block_size>>>(d_QK, N_compute, head_dim);
+      scale<<<N, block_size>>>(d_QK[i], N_compute);
       cudaCheckErrors("kernel launch failure");
       // isnan_test<<<1, 1>>>(d_QK, N, N);
 
       // Set non tokens to -infinity
       // printf("Set non tokens to -infinity\n");
-      set_inf<<<N, block_size>>>(d_QK, N_compute, N_compute, N_tokens);
+      set_inf<<<N, block_size>>>(d_QK[i], N_compute, N_compute, N_tokens);
       cudaCheckErrors("kernel launch failure");
       // isnan_test<<<1, 1>>>(d_QK, N, N);
 
       // Softmax
       // printf("Softmax\n");
-      softmax_max<<<N, block_size>>>(d_QK, N_compute);
+      softmax_max<<<N, block_size>>>(d_QK[i], N_compute);
       cudaCheckErrors("kernel launch failure");
       // isnan_test<<<1, 1>>>(d_QK, N, N);
 
       // Set non tokens to -infinity
       // printf("Set non tokens to -infinity\n");
-      set_zero<<<N, block_size>>>(d_QK, N_compute, N_compute, N_tokens);
+      set_zero<<<N, block_size>>>(d_QK[i], N_compute, N_compute, N_tokens);
       cudaCheckErrors("kernel launch failure");
       // isnan_test<<<1, 1>>>(d_QK, N, N);
 
       // printf("QK_V\n");
-      matmul_mha<<<grid_mha, threads>>>(d_QK, d_V, d_act, N_compute, head_dim, N_compute, head_dim, i, Dim);
+      matmul_mha<<<grid_mha, threads>>>(d_QK[i], d_V, d_act, N_compute, Dim, N_compute, i);
       cudaCheckErrors("kernel launch failure");
       // isnan_test<<<1, 1>>>(d_act, head_dim, N);
       cudaDeviceSynchronize();
@@ -549,7 +568,7 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
     }
   
 
-int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *d_act, float *d_act_wide,
+int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK[num_heads], float *d_act, float *d_act_wide,
       float *linear[N_Layers][4], float *bias[N_Layers][4], float *ln[N_Layers][4], float *mlp1[N_Layers],
       float *mlp_bias1[N_Layers], float *mlp2[N_Layers], float *mlp_bias2[N_Layers], float *ln_final[2],
       float *proj_linear, float *d_output, int Dim, int N, int N_tokens, float *h_output, 
@@ -620,12 +639,13 @@ int main(){
     t0 = clock();
 
     int N = 2048;
-    // int N_tokens =  9;
-    // int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101}; // 257
 
-    int N_tokens =  2016;
-    int text[N_tokens];
-    for(int i = 0; i < N_tokens; i++) text[i] = rand() %(Vocab_OG + 1);
+    int N_tokens =  9;
+    int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101}; // 257
+
+    // int N_tokens =  2016;
+    // int text[N_tokens];
+    // for(int i = 0; i < N_tokens; i++) text[i] = rand() %(Vocab_OG + 1);
 
     int N_compute = ((N_tokens + 32 - 1)/32)*32;
 
@@ -633,7 +653,7 @@ int main(){
            *h_mlp1[N_Layers], *h_mlp_bias1[N_Layers], *h_mlp2[N_Layers], *h_mlp_bias2[N_Layers],
            *h_final_ln[2], *h_proj_linear, *h_ans, *h_pos, *h_emb;
 
-    float *d_input, *d_output, *d_Q, *d_K, *d_QK, *d_V, *d_ACT, *d_ACT_wide, *d_linear[N_Layers][4], 
+    float *d_input, *d_output, *d_Q, *d_K, *d_QK[num_heads], *d_V, *d_ACT, *d_ACT_wide, *d_linear[N_Layers][4], 
       *d_bias[N_Layers][4], *d_ln[N_Layers][4], *d_mlp1[N_Layers],  *d_mlp_bias1[N_Layers],
       *d_mlp2[N_Layers], *d_mlp_bias2[N_Layers], *d_final_ln[2],  *d_proj_linear, *d_act2, *d_emb,
       *d_pos, *d_input2;
@@ -757,12 +777,13 @@ int main(){
     cudaMalloc(&d_Q, N*Dim*sizeof(float));
     cudaMalloc(&d_K, N*Dim*sizeof(float));
     cudaMalloc(&d_V, N*Dim*sizeof(float));  
-    cudaMalloc(&d_QK, N*N*sizeof(float));
     cudaMalloc(&d_ACT, N*Dim*sizeof(float));
     cudaMalloc(&d_ACT_wide, 4*N*Dim*sizeof(float));
     cudaMalloc(&d_act2, N*Dim*sizeof(float));
     cudaMalloc(&d_emb, Dim*Vocab_OG*sizeof(float));
     cudaMalloc(&d_pos, N*Dim*sizeof(float));
+
+    for(int i = 0; i < num_heads; i++) cudaMalloc(&d_QK[i], N*N*sizeof(float));
 
     for (int i = 0; i < N_Layers; i++){
 
