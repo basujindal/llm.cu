@@ -1,28 +1,26 @@
 #include <stdio.h>
 #include "kernels.h"
 
-const int block_size = 32;  // CUDA maximum is 1024 *total* threads in block  
+const int block_size = 32;  // CUDA maximum is 1024 total threads in block  
 const int block_size_vocab = 1024;
 
-__global__ void softmax_max(float *A, size_t ds) {
+__global__ void softmax_max_mha(float *A, size_t ds, int N) {
 
   int idx = threadIdx.x;
+  int head = blockIdx.y;
   __shared__ float sdata[block_size];
   sdata[idx] = 0.0f;
   float val = 0.0f;
 
-  // Total elements this block is supposed to handle
-  int total_elements = ds * ds;
-  int start_index = blockIdx.x * ds; // Start index for this block
+  int start_index = blockIdx.x * ds + head*N*N; // Start index for this block
   int end_index = start_index + ds;  // End index for this block
 
   __shared__ float max_val;
   max_val = 0.0f;
 
   // Find the maximum value in the block
-
   for (int index = start_index + idx; index < end_index; index += blockDim.x) {
-    if (index < ds*ds) sdata[idx] = max(A[index], sdata[idx]);
+    sdata[idx] = max(A[index], sdata[idx]);
   }
 
   for(int s = blockDim.x/2; s > 0; s/=2){
@@ -36,30 +34,81 @@ __global__ void softmax_max(float *A, size_t ds) {
 
   sdata[idx] = 0.0f;
 
-  // Process elements
+  // exp and add
   for (int index = start_index + idx; index < end_index; index += blockDim.x) {
-    if (index < total_elements) {
       val = expf(A[index] - max_val);
       A[index] = val;
       atomicAdd(&sdata[idx], val);
-    }
   }
 
   __syncthreads();
 
   // Sum reduction in shared memory
   for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (idx < s) {
-      sdata[idx] += sdata[idx + s];
-    }
+    if (idx < s) sdata[idx] += sdata[idx + s];
+    
     __syncthreads();
   }
 
   // Normalize the values
   for (int index = start_index + idx; index < end_index; index += blockDim.x) {
-    if (index < total_elements) {
       A[index] /= sdata[0];
-    }
+  }
+}
+
+__global__ void softmax_max(float *A, size_t ds) {
+
+  int idx = threadIdx.x;
+  int head = blockIdx.y;
+  __shared__ float sdata[block_size];
+  sdata[idx] = 0.0f;
+  float val = 0.0f;
+
+  int start_index = blockIdx.x * ds; // Start index for this block
+  int end_index = start_index + ds;  // End index for this block
+
+  if(threadIdx.x == 0){
+    // printf("index = %d %d\n", start_index, end_index);
+  }
+
+  __shared__ float max_val;
+  max_val = 0.0f;
+
+  // Find the maximum value in the block
+  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
+    sdata[idx] = max(A[index], sdata[idx]);
+  }
+
+  for(int s = blockDim.x/2; s > 0; s/=2){
+    __syncthreads();
+    if (idx < s) sdata[idx] = max(sdata[idx], sdata[idx + s]);
+  }
+  __syncthreads();
+
+  if (idx == 0) max_val = sdata[0];
+  __syncthreads();
+
+  sdata[idx] = 0.0f;
+
+  // exp and add
+  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
+      val = expf(A[index] - max_val);
+      A[index] = val;
+      atomicAdd(&sdata[idx], val);
+  }
+
+  __syncthreads();
+
+  // Sum reduction in shared memory
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (idx < s) sdata[idx] += sdata[idx + s];
+    
+    __syncthreads();
+  }
+
+  // Normalize the values
+  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
+      A[index] /= sdata[0];
   }
 }
 
@@ -166,12 +215,10 @@ __global__ void matmul_bias(const float *A, const float *B, float *C, float *bia
       __syncthreads();
     }
   
-
     if(row < N_tokens) C[row*width+col] = temp + bias[col];
     else C[row*width+col] = temp;
   }
 }
-
 
 __global__ void QK_V(const float *QK, const float *V, float *C, int Dim, int N) {
 
@@ -207,87 +254,84 @@ __global__ void QK_V(const float *QK, const float *V, float *C, int Dim, int N) 
   }
 }
 
-__global__ void gelu(float *A, int dim){
+__global__ void matmul_mha_transpose_scale(const float scale_factor, const float *A, const float *B, float *C, int height, int width, int dim, int head_dim, int N) {
 
-    int idx = threadIdx.x;
-    float x;
+  // declare cache in shared memory
+  __shared__ float As[block_size][block_size];
+  __shared__ float Bs[block_size][block_size];
 
-    for(int i = 0; i < dim/blockDim.x; i++){
-        x = A[dim*blockIdx.x + i*blockDim.x + idx];
-        A[dim*blockIdx.x + i*blockDim.x + idx] = x*0.5*(1.0 + tanhf(0.7978845608*(x + 0.044715*x*x*x)));
+  // if(threadIdx.x == 0 && threadIdx.y == 0) printf("head_num %d %d\n", blockIdx.x, blockIdx.y);
+
+  int col = threadIdx.x+blockDim.x*blockIdx.x;
+  int row = threadIdx.y+blockDim.y*blockIdx.y;
+  int head_num = blockIdx.z;
+
+  if ((row < height) && (col < width)){
+    // if(row == 8 && col == 8) printf("final %d %d\n", row, col);
+  
+    float temp = 0;
+    for (int i = 0; i < head_dim/block_size; i++) {
+
+      // Load data into shared memory
+      As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x + head_dim*head_num)];
+      Bs[threadIdx.y][threadIdx.x] = B[col*dim + (block_size*i + threadIdx.y + head_dim*head_num)];
+
+      __syncthreads();
+
+      // Keep track of the running sum
+      for (int k = 0; k < block_size; k++)
+      	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x]; // dot product of row and column
+    
+      __syncthreads();
+
     }
+    
+    C[row*width + head_num*N*N + col] = temp/scale_factor;
+  }
 }
 
-__global__ void add(float *A, float *B, int dim){
+__global__ void matmul_mha(const float *A, const float *B, float *C, int height, int width, int dim, int head_dim, int width_full, int N) {
 
-    int idx = threadIdx.x;
+// N, head_dim, N, head_dim, i, Dim
 
-    for(int i = 0; i < dim/blockDim.x; i++){
-        B[dim*blockIdx.x + i*blockDim.x + idx] = A[dim*blockIdx.x + i*blockDim.x + idx] + B[dim*blockIdx.x + i*blockDim.x + idx];
+  // declare cache in shared memory
+  __shared__ float As[block_size][block_size];
+  __shared__ float Bs[block_size][block_size];
+
+  // As[threadIdx.y][threadIdx.x] = 0.0f;
+  // Bs[threadIdx.y][threadIdx.x] = 0.0f;
+
+  int row = threadIdx.y+blockDim.y*blockIdx.y;
+  int head_num = blockIdx.z;
+  int col = threadIdx.x+blockDim.x*blockIdx.x + head_dim*head_num;
+  
+  // if(threadIdx.x == 0 && threadIdx.y == 0) printf("headnum, %d\n", head_num);
+  
+  if ((row < height) && (col < width_full)){
+
+    float temp = 0;
+    for (int i = 0; i < dim/block_size; i++) {
+
+      // Load data into shared memory
+      As[threadIdx.y][threadIdx.x] = A[N*N*head_num + row*dim + (block_size*i + threadIdx.x)];
+      Bs[threadIdx.y][threadIdx.x] = B[col + width_full*(block_size*i + threadIdx.y)];
+
+      __syncthreads();
+
+      // Keep track of the running sum
+      for (int k = 0; k < block_size; k++)
+      	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x]; // dot product of row and column
+    
+      __syncthreads();
+
     }
-
+    // if(
+    //   threadIdx.x == 0 && threadIdx.y == 0 )printf("final %d %d %d\n", row*width_full, width_full,  col);
+    C[row*width_full+col] = temp;
+  }
 }
 
-// scale<<<N, block_size>>>(d_QK, head_dim, N, head_dim);
-
-__global__ void scale(float *A, int N, int head_dim){
-
-    int idx = threadIdx.x;
-
-    for(int i = 0; i < N/blockDim.x; i++){
-        A[N*blockIdx.x + i*blockDim.x + idx] = A[N*blockIdx.x + i*blockDim.x + idx]/sqrtf(head_dim);
-    }
-
-}
-
-// set traingle values  and values outside N_tokens*N_tokens to -infinity
-__global__ void set_inf(float *A, int dim, int N, int N_tokens){
-
-    int idx = threadIdx.x;
-    int NEG_INF = -50;
-    if(blockIdx.x < N_tokens){
-      for(int i = 0; i < dim/blockDim.x; i++){
-          if (i*blockDim.x + idx < N_tokens &&  i*blockDim.x + idx < blockIdx.x+1) continue;
-          A[dim*blockIdx.x + i*blockDim.x + idx] = NEG_INF;
-        }
-    }
-    else{
-      for(int i = 0; i < dim/blockDim.x; i++) A[dim*blockIdx.x + i*blockDim.x + idx] = NEG_INF;
-    }
-}
-
-// set all values to -infinity except for N_tokens*N_tokens block
-__global__ void set_zero(float *A, int dim, int N, int N_tokens){
-
-    int idx = threadIdx.x;
-
-    if(blockIdx.x < N_tokens){
-      for(int i = 0; i < dim/blockDim.x; i++){
-          if (i*blockDim.x + idx < N_tokens) continue;
-          A[dim*blockIdx.x + i*blockDim.x + idx] = 0;
-        }
-    }
-    else{
-      for(int i = 0; i < dim/blockDim.x; i++) A[dim*blockIdx.x + i*blockDim.x + idx] = 0;
-    }
-}
-
-__global__ void isnan_test(float *data, int width, int height){
-
-  int idx = threadIdx.x+blockDim.x*blockIdx.x;
-
-  while (idx < width){
-    for (int i = 0; i < height; i++){
-      if (isnan(data[(i*width) + idx]) || isinf(data[(i*width) + idx])){
-        printf("NAN or INF at %d, %d\n", i, idx);
-        return;
-      }
-    }
-    idx += gridDim.x+blockDim.x;
-    }
-}
-
-__global__ void matmul_mha_transpose(const float *A, const float *B, float *C, int height, int width, int dim, int head_dim, int head_num) {
+__global__ void matmul_attn_transpose(const float *A, const float *B, float *C, int height, int width, int dim, int head_dim, int head_num) {
 
   // declare cache in shared memory
   __shared__ float As[block_size][block_size];
@@ -324,8 +368,7 @@ __global__ void matmul_mha_transpose(const float *A, const float *B, float *C, i
   }
 }
 
-
-__global__ void matmul_mha(const float *A, const float *B, float *C, int height, int width, int dim, int head_dim, int head_num, int width_full ) {
+__global__ void matmul_attn(const float *A, const float *B, float *C, int height, int width, int dim, int head_dim, int head_num, int width_full ) {
 
 // N, head_dim, N, head_dim, i, Dim
 
@@ -362,6 +405,93 @@ __global__ void matmul_mha(const float *A, const float *B, float *C, int height,
     //   threadIdx.x == 0 && threadIdx.y == 0 )printf("final %d %d %d\n", row*width_full, width_full,  col);
     C[row*width_full+col] = temp;
   }
+}
+
+__global__ void gelu(float *A, int dim){
+
+    int idx = threadIdx.x;
+    float x;
+
+    for(int i = 0; i < dim/blockDim.x; i++){
+        x = A[dim*blockIdx.x + i*blockDim.x + idx];
+        A[dim*blockIdx.x + i*blockDim.x + idx] = x*0.5*(1.0 + tanhf(0.7978845608*(x + 0.044715*x*x*x)));
+    }
+}
+
+__global__ void add(float *A, float *B, int dim){
+
+    int idx = threadIdx.x;
+
+    for(int i = 0; i < dim/blockDim.x; i++){
+        B[dim*blockIdx.x + i*blockDim.x + idx] = A[dim*blockIdx.x + i*blockDim.x + idx] + B[dim*blockIdx.x + i*blockDim.x + idx];
+    }
+
+}
+
+__global__ void scale(float *A, int N, int head_dim){
+
+    int idx = threadIdx.x;
+
+    for(int i = 0; i < N/blockDim.x; i++){
+        A[N*blockIdx.x + i*blockDim.x + idx] = A[N*blockIdx.x + i*blockDim.x + idx]/sqrtf(head_dim);
+    }
+
+}
+
+// set traingle values and values outside N_tokens*N_tokens to -infinity
+__global__ void set_inf(float *A, int dim, int N_tokens){
+
+    int idx = threadIdx.x;
+    int NEG_INF = -50;
+
+    for(int i = 0; i < dim/blockDim.x; i++){
+          if (i*blockDim.x + idx < N_tokens && i*blockDim.x + idx < blockIdx.x+1) continue;
+          A[dim*blockIdx.x + i*blockDim.x + idx] = NEG_INF;
+    }
+}
+
+// set traingle values and values outside N_tokens*N_tokens to -infinity
+__global__ void set_inf_mha(float *A, int dim, int N, int N_tokens){
+
+    int idx = threadIdx.x;
+    int head = blockIdx.y;
+    int NEG_INF = -50;
+
+    for(int i = 0; i < dim/blockDim.x; i++){
+          if (i*blockDim.x + idx < N_tokens && i*blockDim.x + idx < blockIdx.x+1) continue;
+          A[head*N*N + dim*blockIdx.x + i*blockDim.x + idx] = NEG_INF;
+    }
+}
+
+// set all values to 0 except for N_tokens*N_tokens block
+__global__ void set_zero(float *A, int dim, int N, int N_tokens){
+
+    int idx = threadIdx.x;
+
+    if(blockIdx.x < N_tokens){
+      for(int i = 0; i < dim/blockDim.x; i++){
+          if (i*blockDim.x + idx < N_tokens) continue;
+          A[dim*blockIdx.x + i*blockDim.x + idx] = 0;
+        }
+    }
+    else{
+      for(int i = 0; i < dim/blockDim.x; i++) A[dim*blockIdx.x + i*blockDim.x + idx] = 0;
+    }
+}
+
+__global__ void isnan_test(float *data, int width, int height){
+
+  int idx = threadIdx.x+blockDim.x*blockIdx.x;
+
+  while (idx < width){
+    for (int i = 0; i < height; i++){
+      if (isnan(data[(i*width) + idx]) || isinf(data[(i*width) + idx])){
+        printf("NAN or INF at %d, %d\n", i, idx);
+        return;
+      }
+    }
+    idx += gridDim.x+blockDim.x;
+    }
 }
 
 __global__ void max_index(float *A, size_t height, size_t width, int *max_idx) {

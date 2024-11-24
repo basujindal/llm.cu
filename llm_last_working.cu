@@ -34,111 +34,91 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *
     dim3 threads(block_size, block_size);
     dim3 grid((Dim + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size);
 
-
-    // printf("Layer Normalization\n");
+    // Layer Normalization;
     layernorm<<<N_tokens, block_size>>>(d_input, d_act, Dim, ln[0], ln[1]);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act, Dim, N);
 
-    // printf("Q\n");
+    // Q;
     matmul_bias<<<grid, threads>>>(d_act, linear[0], d_Q, bias[0], N_compute, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_Q, Dim, N);
 
-    // printf("K\n");
+    // K;
     matmul_bias<<<grid, threads>>>(d_act, linear[1], d_K, bias[1], N_compute, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_K, Dim, N);   
 
-    // printf("V\n");
+    // V;
     matmul_bias<<<grid, threads>>>(d_act, linear[2], d_V, bias[2], N_compute, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_V, Dim, N);
 
+    // // Start MHA
+
     int head_dim = Dim/num_heads;
-    dim3 grid_mha((Dim + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size);
+    float scale_factor = sqrtf(head_dim);
 
-    dim3 grid_mha_transpose((N_compute + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size);
+    dim3 grid_mha_transpose((N_compute + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size, num_heads);
+    dim3 grid_softmax_mha(N_tokens, num_heads, 1);
+    dim3 grid_mha((Dim + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size, num_heads);
+    dim3 grid_wide((4*Dim + threads.x - 1)/block_size, (N_compute + threads.y - 1)/block_size);
+    dim3 threads_mha(block_size, block_size, 1);
 
-    for (int i = 0; i < num_heads; i++){
-  
-      // printf("QK\n"); 
-      matmul_mha_transpose<<<grid_mha_transpose, threads>>>(d_Q, d_K, d_QK, N_compute, N_compute, Dim, head_dim, i);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
-      
-      // scale by sqrt(d_k)
-      // printf("Scale\n");
-      scale<<<N, block_size>>>(d_QK, N_compute, head_dim);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
+    // QK; 
+    matmul_mha_transpose_scale<<<grid_mha_transpose, threads_mha>>>(scale_factor, d_Q, d_K, d_QK, N_compute, N_compute, Dim, head_dim, N);
+    cudaCheckErrors("kernel launch failure");
 
-      // Set non tokens to -infinity
-      // printf("Set non tokens to -infinity\n");
-      set_inf<<<N, block_size>>>(d_QK, N_compute, N_compute, N_tokens);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
+    // Set upper triangle to -inf
+    set_inf_mha<<<grid_softmax_mha, block_size>>>(d_QK, N_compute, N, N_tokens);
+    cudaCheckErrors("kernel launch failure");
 
-      // Softmax
-      // printf("Softmax\n");
-      softmax_max<<<N, block_size>>>(d_QK, N_compute);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
+    // Softmax
+    softmax_max_mha<<<grid_softmax_mha, block_size>>>(d_QK, N_compute, N);
+    cudaCheckErrors("kernel launch failure");
+    // isnan_test<<<1, 1>>>(d_QK, N, N);
 
-      // Set non tokens to -infinity
-      // printf("Set non tokens to -infinity\n");
-      set_zero<<<N, block_size>>>(d_QK, N_compute, N_compute, N_tokens);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
+    // QKV
+    matmul_mha<<<grid_mha, threads_mha>>>(d_QK, d_V, d_act, N_compute, head_dim, N_compute, head_dim, Dim, N);
+    cudaCheckErrors("kernel launch failure");
+    // isnan_test<<<1, 1>>>(d_act, head_dim, N);
+    cudaDeviceSynchronize();
 
-      // printf("QK_V\n");
-      matmul_mha<<<grid_mha, threads>>>(d_QK, d_V, d_act, N_compute, head_dim, N_compute, head_dim, i, Dim);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_act, head_dim, N);
-      cudaDeviceSynchronize();
-
-    }
-
-    // printf("Final output\n");
+    // Final output;
     matmul_bias<<<grid, threads>>>(d_act, linear[3], d_act2, bias[3], N_compute, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act, Dim, N);
 
+    // // End MHA
+
     // Residual connection
-    // printf("Residual connection\n");
     add<<<N, block_size_linear>>>(d_act2, d_input, Dim);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_input, Dim, N);
 
     // Layer Normalization
-    // printf("Layer Normalization\n");
     layernorm<<<N_tokens, block_size>>>(d_input, d_act, Dim, ln[2], ln[3]);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_input, Dim, N);
 
-    dim3 grid_wide((4*Dim + threads.x - 1)/block_size, (N_compute + threads.y - 1)/block_size);
-    // Matmul
-    // printf("Mlp1\n");
+    // mlp1
     matmul_bias<<<grid_wide, threads>>>(d_act, mlp1, d_act_wide, mlp_bias1, N_compute, 4*Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act_wide, Dim, N);
 
     //gelu
-    // printf("Gelu\n");
     gelu<<<N, block_size>>>(d_act_wide, 4*Dim);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act_wide, 4*Dim, N);
     cudaDeviceSynchronize();
-    // cudaCheckErrors("kernel launch failure");
 
-    // printf("mlp2\n");
+    // mlp2;
     matmul_bias<<<grid, threads>>>(d_act_wide, mlp2, d_act, mlp_bias2, N_compute, Dim, 4*Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act, Dim, N);
     cudaDeviceSynchronize();
 
     // Residual connection
-    // printf("Residual connection\n");
     add<<<N_compute, block_size_linear>>>(d_act, d_input, Dim);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_input, Dim, N);
@@ -193,7 +173,6 @@ int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK,
 
       }
 
-
 // struct GPT2Weights{
   
 //       float *h_input;
@@ -212,19 +191,24 @@ int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK,
 //       float  *h_emb;
 // };
 
-
 int main(){
 
-
+    printf("Running \n");
     clock_t t0, t1;
     double t1sum=0.0;
     t0 = clock();
     int N = 2048;
 
     // // Test generation
-    // int N_tokens =  9;
-    // int num_new_tokens = 5;
-    // int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101}; // 257
+    // int N_tokens =  59;
+    // int num_new_tokens = 10;
+    // // Expected generation 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314
+    // printf("Expected generation \n 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314 \n");
+    // int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101, 257, 6260, 11,
+    //                       290, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260,
+    //                       13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260,
+    //                       13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260,
+    //                       13, 314}; 
 
     // Test max generation time
     int N_tokens =  2016;
@@ -303,17 +287,15 @@ int main(){
         h_proj_linear[i*Vocab + j] = h_proj_linear_og[i*Vocab_OG + j];
       }
     }
-    
 
     // allocate device space
-
     cudaMalloc(&d_input, N*Dim*sizeof(float));
     cudaMalloc(&d_input2, N*Dim*sizeof(float));
     cudaMalloc(&d_output, N*Vocab*sizeof(float));
     cudaMalloc(&d_Q, N*Dim*sizeof(float));
     cudaMalloc(&d_K, N*Dim*sizeof(float));
     cudaMalloc(&d_V, N*Dim*sizeof(float));  
-    cudaMalloc(&d_QK, N*N*sizeof(float));
+    cudaMalloc(&d_QK, num_heads*N*N*sizeof(float));
     cudaMalloc(&d_ACT, N*Dim*sizeof(float));
     cudaMalloc(&d_ACT_wide, 4*N*Dim*sizeof(float));
     cudaMalloc(&d_act2, N*Dim*sizeof(float));
@@ -409,16 +391,18 @@ int main(){
       cudaDeviceSynchronize();
 
       N_tokens++;
-      N_compute = ((N_tokens + 32 - 1)/32)*32;
+      N_compute = ((N_tokens + block_size - 1)/block_size)*block_size;
+      if(z == 0) printf("N compute tokens = %d \n", N_compute);
 
       // Initialization timing
       t1sum = ((double)(clock() - t0))/CLOCKS_PER_SEC;
       // printf("Time per token = %f seconds\n", t1sum);
       printf("%d, %f second\n ", *new_token, t1sum);
+      // printf("%d, ", *new_token);
 
     }
 
-    printf("Time for %d tokens = %f seconds\n", num_new_tokens, ((double)(clock() - t1))/CLOCKS_PER_SEC);
+    printf("\nTime for %d tokens = %f seconds\n", num_new_tokens, ((double)(clock() - t1))/CLOCKS_PER_SEC);
 
     return 0;
 

@@ -6,6 +6,8 @@
 
 ## Performance
 
+`nvcc -arch=sm_75 --allow-unsupported-compiler llm_last_working.cu load_weights.cu kernels.cu -o test && ./test`
+
 Time refers to generating 32 tokens starting from the 2016 till 2048 tokens.
 
 Iteration 1: ~= 49s
@@ -13,7 +15,7 @@ Iteration 2: 2
 
 ## Future Work
 
-- [ ] Use 3D grid for the MultiHeadAttention
+- [x] Use 3D grid for the MultiHeadAttention
 - [ ] KV cache
 - [ ] Combine the kernels
 - [ ] Add tests
