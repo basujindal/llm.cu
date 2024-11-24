@@ -25,7 +25,6 @@ nvcc -arch=sm_75 --allow-unsupported-compiler llm.cu load_weights.cu kernels.cu 
 Time refers to generating 32 tokens starting from the 2016 till 2048 tokens.
 
 Iteration 1: ~= 49s
-Iteration 2: 2
 
 ## Future Work
 
