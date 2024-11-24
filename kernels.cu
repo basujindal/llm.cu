@@ -59,7 +59,6 @@ __global__ void softmax_max_mha(float *A, size_t ds, int N) {
 __global__ void softmax_max(float *A, size_t ds) {
 
   int idx = threadIdx.x;
-  int head = blockIdx.y;
   __shared__ float sdata[block_size];
   sdata[idx] = 0.0f;
   float val = 0.0f;

@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <time.h>
+#include "load_weights.h"
+#include "kernels.h"
 using namespace std;
 
 // error checking macro
@@ -22,543 +24,101 @@ const int block_size_linear = 768;
 const int block_size_vocab = 1024;
 const int Vocab_OG = 50257;
 const int Vocab = 50272;
-const int head_dim = 64;
 const int num_heads = 12;
-int num_new_tokens = 32;
 const int N_Layers = 12;
 
-// const int num_heads = 1;
-// int num_new_tokens = 1;
-// const int N_Layers = 1;
-
-
-__global__ void softmax_max(float *A, size_t ds) {
-
-  int idx = threadIdx.x;
-  __shared__ float sdata[block_size];
-  sdata[idx] = 0.0f;
-  float val = 0.0f;
-
-  // Total elements this block is supposed to handle
-  int total_elements = ds * ds;
-  int start_index = blockIdx.x * ds; // Start index for this block
-  int end_index = start_index + ds;  // End index for this block
-
-  __shared__ float max_val;
-  max_val = 0.0f;
-
-  // Find the maximum value in the block
-
-  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
-    if (index < ds*ds) sdata[idx] = max(A[index], sdata[idx]);
-  }
-
-  for(int s = blockDim.x/2; s > 0; s/=2){
-    __syncthreads();
-    if (idx < s) sdata[idx] = max(sdata[idx], sdata[idx + s]);
-  }
-  __syncthreads();
-
-  if (idx == 0) max_val = sdata[0];
-  __syncthreads();
-
-  sdata[idx] = 0.0f;
-
-  // Process elements
-  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
-    if (index < total_elements) {
-      val = expf(A[index] - max_val);
-      A[index] = val;
-      atomicAdd(&sdata[idx], val);
-    }
-  }
-
-  __syncthreads();
-
-  // Sum reduction in shared memory
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (idx < s) {
-      sdata[idx] += sdata[idx + s];
-    }
-    __syncthreads();
-  }
-
-  // Normalize the values
-  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
-    if (index < total_elements) {
-      A[index] /= sdata[0];
-    }
-  }
-}
-
-__global__ void layernorm(float *A, float *B, int dim, float *gamma, float *beta){
-
-    int idx = threadIdx.x;
-
-    __shared__ float sdata[block_size];
-    __shared__ float sum;
-    sdata[idx] = 0.0f;
-    sum = 0.0f;
-    float val = 0.0f;
-
-    for(int i = 0; i < dim/blockDim.x; i++) sdata[idx] += A[dim*blockIdx.x + i*blockDim.x + idx];
-
-    for(int s = blockDim.x/2; s > 0; s/=2){
-    __syncthreads();
-    if (idx < s) sdata[idx] += sdata[idx + s];
-    }
-
-    if(idx == 0) sum = sdata[0]/dim;
-
-    __syncthreads();
-
-    sdata[idx] = 0.0f;
-
-    for(int i = 0; i < dim/blockDim.x; i++){
-        val = (A[dim*blockIdx.x + i*blockDim.x + idx] - sum);
-        sdata[idx] += val*val;
-    }
-
-    for(int s = blockDim.x/2; s > 0; s/=2){
-        __syncthreads();
-        if (idx < s) sdata[idx] += sdata[idx + s];
-    }
-
-    if (idx == 0) sdata[0] = 1/sqrt(sdata[0]/dim + 0.00001);
-
-    __syncthreads();
-
-    for(int i = 0; i < dim/blockDim.x; i++){
-        B[dim*blockIdx.x + i*blockDim.x + idx] = (A[dim*blockIdx.x + i*blockDim.x + idx] - sum)*sdata[0]*gamma[i*blockDim.x + idx] + beta[i*blockDim.x + idx];
-    }
-
-}
-
-__global__ void matmul(const float *A, const float *B, float *C, int height, int width, int dim) {
-
-  // declare cache in shared memory
-  __shared__ float As[block_size][block_size];
-  __shared__ float Bs[block_size][block_size];
-
-  int col = threadIdx.x+blockDim.x*blockIdx.x;
-  int row = threadIdx.y+blockDim.y*blockIdx.y;
-
-  if ((row < height) && (col < width)){
-    float temp = 0;
-    int iter = dim/block_size;
-    for (int i = 0; i < iter; i++) {
-
-      // Load data into shared memory
-      As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x)];
-      Bs[threadIdx.y][threadIdx.x] = B[col + width*(block_size*i + threadIdx.y)];
-
-      __syncthreads();
-
-      // Keep track of the running sum
-      // for (int k = 0; k < block_size; k++)
-
-      for (int k = 0; k < block_size; k++)
-        temp += As[threadIdx.y][k] * Bs[k][threadIdx.x]; // dot product of row and column
-
-      __syncthreads();
-
-    }
-
-    C[row*width+col] = temp;
-  }
-}
-
-__global__ void matmul_bias(const float *A, const float *B, float *C, float *bias, int height, int width, int dim, int N_tokens) {
-
-  // declare cache in shared memory
-  __shared__ float As[block_size][block_size];
-  __shared__ float Bs[block_size][block_size];
-
-  int row = threadIdx.y+blockDim.y*blockIdx.y;
-  int col = threadIdx.x+blockDim.x*blockIdx.x;
-  
-
-  if ((row < height) && (col < width)){
-    float temp = 0;
-    for (int i = 0; i < dim/block_size; i++) {
-
-      // Load data into shared memory
-      As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x)];
-      Bs[threadIdx.y][threadIdx.x] = B[col + width*(block_size*i + threadIdx.y)];
-
-      __syncthreads();
-
-      // Keep track of the running sum
-      for (int k = 0; k < block_size; k++)
-      	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x]; // dot product of row and column
-      __syncthreads();
-    }
-  
-
-    if(row < N_tokens) C[row*width+col] = temp + bias[col];
-    else C[row*width+col] = temp;
-  }
-}
-
-
-__global__ void QK_V(const float *QK, const float *V, float *C, int Dim, int N) {
-
-  // declare cache in shared memory
-  __shared__ float As[block_size][block_size];
-  __shared__ float Bs[block_size][block_size];
-  
-  int col = threadIdx.x+blockDim.x*blockIdx.x; // create thread x index
-  int row = threadIdx.y+blockDim.y*blockIdx.y; // create thread y index
-
-  if ((row < N) && (col < Dim)){
-    float temp = 0, val, sum = 0;
-
-    for (int i = 0; i < N/block_size; i++) {
-
-      // Load data into shared memory
-      As[threadIdx.y][threadIdx.x] = expf(QK[row*N + (block_size*i + threadIdx.x)]);
-      Bs[threadIdx.y][threadIdx.x] = V[col + Dim*(block_size*i + threadIdx.y)];
-
-      __syncthreads();
-
-      for (int k = 0; k < block_size; k++){
-        val = As[threadIdx.y][k];
-      	temp +=  val * Bs[k][threadIdx.x]; // dot product of row and column
-        sum+=val;
-      }
-
-      __syncthreads();
-
-    }
-
-    C[row*Dim+col] = temp/sum;
-  }
-}
-
-__global__ void gelu(float *A, int dim){
-
-    int idx = threadIdx.x;
-    float x;
-
-    for(int i = 0; i < dim/blockDim.x; i++){
-        x = A[dim*blockIdx.x + i*blockDim.x + idx];
-        A[dim*blockIdx.x + i*blockDim.x + idx] = x*0.5*(1.0 + tanhf(0.7978845608*(x + 0.044715*x*x*x)));
-    }
-}
-
-__global__ void add(float *A, float *B, int dim){
-
-    int idx = threadIdx.x;
-
-    for(int i = 0; i < dim/blockDim.x; i++){
-        B[dim*blockIdx.x + i*blockDim.x + idx] = A[dim*blockIdx.x + i*blockDim.x + idx] + B[dim*blockIdx.x + i*blockDim.x + idx];
-    }
-
-}
-
-__global__ void scale(float *A, int N){
-
-    int idx = threadIdx.x;
-
-    for(int i = 0; i < N/blockDim.x; i++){
-        A[N*blockIdx.x + i*blockDim.x + idx] = A[N*blockIdx.x + i*blockDim.x + idx]/sqrtf(head_dim);
-    }
-
-}
-
-// set traingle values  and values outside N_tokens*N_tokens to -infinity
-__global__ void set_inf(float *A, int dim, int N, int N_tokens){
-
-    int idx = threadIdx.x;
-    int NEG_INF = -50;
-    if(blockIdx.x < N_tokens){
-      for(int i = 0; i < dim/blockDim.x; i++){
-          if (i*blockDim.x + idx < N_tokens &&  i*blockDim.x + idx < blockIdx.x+1) continue;
-          A[dim*blockIdx.x + i*blockDim.x + idx] = NEG_INF;
-        }
-    }
-    else{
-      for(int i = 0; i < dim/blockDim.x; i++) A[dim*blockIdx.x + i*blockDim.x + idx] = NEG_INF;
-    }
-}
-
-// set all values to -infinity except for N_tokens*N_tokens block
-__global__ void set_zero(float *A, int dim, int N, int N_tokens){
-
-    int idx = threadIdx.x;
-
-    if(blockIdx.x < N_tokens){
-      for(int i = 0; i < dim/blockDim.x; i++){
-          if (i*blockDim.x + idx < N_tokens) continue;
-          A[dim*blockIdx.x + i*blockDim.x + idx] = 0;
-        }
-    }
-    else{
-      for(int i = 0; i < dim/blockDim.x; i++) A[dim*blockIdx.x + i*blockDim.x + idx] = 0;
-    }
-}
-
-__global__ void isnan_test(float *data, int width, int height){
-
-  int idx = threadIdx.x+blockDim.x*blockIdx.x;
-
-  while (idx < width){
-    for (int i = 0; i < height; i++){
-      if (isnan(data[(i*width) + idx]) || isinf(data[(i*width) + idx])){
-        printf("NAN or INF at %d, %d\n", i, idx);
-        return;
-      }
-    }
-    idx += gridDim.x+blockDim.x;
-    }
-}
-
-__global__ void matmul_mha_transpose(const float *A, const float *B, float *C, int height, int width, int dim, int head_num) {
-
-  __shared__ float As[block_size][block_size];
-  __shared__ float Bs[block_size][block_size];
-
-  int col = threadIdx.x+blockDim.x*blockIdx.x;
-  int row = threadIdx.y+blockDim.y*blockIdx.y;
-  
-  if ((row < height) && (col < width)){
-  
-    float temp = 0;
-    for (int i = 0; i < head_dim/block_size; i++) {
-
-      As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x + head_dim*head_num)];
-      Bs[threadIdx.y][threadIdx.x] = B[col*dim + (block_size*i + threadIdx.y + head_dim*head_num)];
-
-      __syncthreads();
-
-      for (int k = 0; k < block_size; k++)
-      	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x];
-    
-      __syncthreads();
-    }
-    
-    C[row*width+col] = temp;
-  }
-}
-
-__global__ void matmul_mha_transpose_z(const float *A, const float *B, float *C[num_heads], int height, int width, int dim) {
-
-  __shared__ float As[block_size][block_size];
-  __shared__ float Bs[block_size][block_size];
-
-  int col = threadIdx.x + blockDim.x*blockIdx.x;
-
-  int row = threadIdx.y + blockDim.y*blockIdx.y;
-
-  int depth = threadIdx.z + blockDim.z*blockIdx.z;
-  
-  if ((row < height) && (col < width)){
-  
-    float temp = 0;
-    for (int i = 0; i < head_dim/block_size; i++) {
-
-      As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x + head_dim*depth)];
-      Bs[threadIdx.y][threadIdx.x] = B[col*dim + (block_size*i + threadIdx.y + head_dim*depth)];
-
-      __syncthreads();
-
-      for (int k = 0; k < block_size; k++)
-      	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x];
-    
-      __syncthreads();
-    }
-
-    if(depth == 1) printf("Depth %d, row %d, col %d\n", depth, row, row*width+col);
-    
-    C[depth][row*width+col] = temp;
-  }
-  
-}
-
-
-__global__ void matmul_mha(const float *A, const float *B, float *C, int height, int width, int dim, int head_num) {
-
-  __shared__ float As[block_size][block_size];
-  __shared__ float Bs[block_size][block_size];
-
-  int row = threadIdx.y+blockDim.y*blockIdx.y;
-  int col = threadIdx.x+blockDim.x*blockIdx.x + head_dim*head_num;
-  
-  if ((row < height) && (col < width)){
-
-    float temp = 0;
-    for (int i = 0; i < dim/block_size; i++) {
-
-      As[threadIdx.y][threadIdx.x] = A[row*dim + (block_size*i + threadIdx.x)];
-      Bs[threadIdx.y][threadIdx.x] = B[col + width*(block_size*i + threadIdx.y)];
-
-      __syncthreads();
-
-      for (int k = 0; k < block_size; k++)
-      	temp += As[threadIdx.y][k] * Bs[k][threadIdx.x]; // dot product of row and column
-    
-      __syncthreads();
-
-    }
-    
-    C[row*width+col] = temp;
-  }
-}
-
-__global__ void max_index(float *A, size_t height, size_t width, int *max_idx) {
-
-  int idx = threadIdx.x;
-  __shared__ int sdata[block_size_vocab];
-
-  sdata[idx] = 0;
-
-  int start_index = blockIdx.x * width; // Start index for this block
-  int end_index = start_index + width;  // End index for this block
-
-  for (int index = start_index + idx; index < end_index; index += blockDim.x) {
-    if (index < height*width && A[index] > A[sdata[idx]]) sdata[idx] = index;
-    
-  }
-
-  for(int s = blockDim.x/2; s > 0; s/=2){
-    __syncthreads();
-    if (idx < s &&  A[sdata[idx + s]] > A[sdata[idx]]) sdata[idx] = sdata[idx + s];
-  }
-  __syncthreads();
-
-  if (idx == 0) *max_idx = sdata[0];
- 
-}
-
-// set all values to -infinity except for N_tokens*N_tokens block
-__global__ void set_new_embedding(float *A, int dim, int N_tokens, float *emb, int *new_token, float *pos){
-
-    int idx = threadIdx.x;
-    for(int i = 0; i < dim/blockDim.x; i++) 
-    A[dim*N_tokens + i*blockDim.x + idx] = emb[new_token[0]*dim + i*blockDim.x + idx] + pos[N_tokens*dim + i*blockDim.x + idx];
-    
-}
-
-int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK[num_heads], float *d_act, float *d_act_wide,
+int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *d_act, float *d_act_wide,
       float *linear[4], float *bias[4], float *ln[], float *mlp1, float *mlp_bias1, float *mlp2, float *mlp_bias2,
       int Dim, int N, int N_tokens, float *h_output, float *d_act2, int N_compute){
 
     dim3 threads(block_size, block_size);
     dim3 grid((Dim + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size);
 
-
-    // printf("Layer Normalization\n");
+    // Layer Normalization;
     layernorm<<<N_tokens, block_size>>>(d_input, d_act, Dim, ln[0], ln[1]);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act, Dim, N);
 
-    // printf("Q\n");
+    // Q;
     matmul_bias<<<grid, threads>>>(d_act, linear[0], d_Q, bias[0], N_compute, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_Q, Dim, N);
 
-    // printf("K\n");
+    // K;
     matmul_bias<<<grid, threads>>>(d_act, linear[1], d_K, bias[1], N_compute, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_K, Dim, N);   
 
-    // printf("V\n");
+    // V;
     matmul_bias<<<grid, threads>>>(d_act, linear[2], d_V, bias[2], N_compute, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_V, Dim, N);
 
-    dim3 grid_mha((Dim + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size);
+    // // Start MHA
 
-    dim3 threads_transpose(block_size, block_size, 1);
-    dim3 grid_mha_transpose((N_compute + threads_transpose.y - 1)/block_size, (N_compute + threads_transpose.x - 1)/block_size, num_heads);
-      
-    printf("QK\n"); 
-    matmul_mha_transpose_z<<<grid_mha_transpose, threads_transpose>>>(d_Q, d_K, d_QK, N_compute, N_compute, Dim);
+    int head_dim = Dim/num_heads;
+    float scale_factor = sqrtf(head_dim);
+
+    dim3 grid_mha_transpose((N_compute + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size, num_heads);
+    dim3 grid_softmax_mha(N_tokens, num_heads, 1);
+    dim3 grid_mha((Dim + threads.y - 1)/block_size, (N_compute + threads.x - 1)/block_size, num_heads);
+    dim3 grid_wide((4*Dim + threads.x - 1)/block_size, (N_compute + threads.y - 1)/block_size);
+    dim3 threads_mha(block_size, block_size, 1);
+
+    // QK; 
+    matmul_mha_transpose_scale<<<grid_mha_transpose, threads_mha>>>(scale_factor, d_Q, d_K, d_QK, N_compute, N_compute, Dim, head_dim, N);
     cudaCheckErrors("kernel launch failure");
-    cudaDeviceSynchronize();
+
+    // Set upper triangle to -inf
+    set_inf_mha<<<grid_softmax_mha, block_size>>>(d_QK, N_compute, N, N_tokens);
+    cudaCheckErrors("kernel launch failure");
+
+    // Softmax
+    softmax_max_mha<<<grid_softmax_mha, block_size>>>(d_QK, N_compute, N);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_QK, N, N);
 
-    printf("QK_V\n");
+    // QKV
+    matmul_mha<<<grid_mha, threads_mha>>>(d_QK, d_V, d_act, N_compute, head_dim, N_compute, head_dim, Dim, N);
+    cudaCheckErrors("kernel launch failure");
+    // isnan_test<<<1, 1>>>(d_act, head_dim, N);
     cudaDeviceSynchronize();
 
-    for (int i = 0; i < num_heads; i++){
-
-      printf("Head %d\n", i);
-      cudaDeviceSynchronize();
-
-      // scale by sqrt(d_k)
-      // printf("Scale\n");
-      scale<<<N, block_size>>>(d_QK[i], N_compute);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
-
-      // Set non tokens to -infinity
-      // printf("Set non tokens to -infinity\n");
-      set_inf<<<N, block_size>>>(d_QK[i], N_compute, N_compute, N_tokens);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
-
-      // Softmax
-      // printf("Softmax\n");
-      softmax_max<<<N, block_size>>>(d_QK[i], N_compute);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
-
-      // Set non tokens to -infinity
-      // printf("Set non tokens to -infinity\n");
-      set_zero<<<N, block_size>>>(d_QK[i], N_compute, N_compute, N_tokens);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_QK, N, N);
-
-      // printf("QK_V\n");
-      matmul_mha<<<grid_mha, threads>>>(d_QK[i], d_V, d_act, N_compute, Dim, N_compute, i);
-      cudaCheckErrors("kernel launch failure");
-      // isnan_test<<<1, 1>>>(d_act, head_dim, N);
-      cudaDeviceSynchronize();
-
-    }
-
-    // printf("Final output\n");
+    // Final output;
     matmul_bias<<<grid, threads>>>(d_act, linear[3], d_act2, bias[3], N_compute, Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act, Dim, N);
 
+    // // End MHA
+
     // Residual connection
-    // printf("Residual connection\n");
     add<<<N, block_size_linear>>>(d_act2, d_input, Dim);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_input, Dim, N);
 
     // Layer Normalization
-    // printf("Layer Normalization\n");
     layernorm<<<N_tokens, block_size>>>(d_input, d_act, Dim, ln[2], ln[3]);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_input, Dim, N);
 
-    dim3 grid_wide((4*Dim + threads.x - 1)/block_size, (N_compute + threads.y - 1)/block_size);
-    // Matmul
-    // printf("Mlp1\n");
+    // mlp1
     matmul_bias<<<grid_wide, threads>>>(d_act, mlp1, d_act_wide, mlp_bias1, N_compute, 4*Dim, Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act_wide, Dim, N);
 
     //gelu
-    // printf("Gelu\n");
     gelu<<<N, block_size>>>(d_act_wide, 4*Dim);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act_wide, 4*Dim, N);
     cudaDeviceSynchronize();
-    // cudaCheckErrors("kernel launch failure");
 
-    // printf("mlp2\n");
+    // mlp2;
     matmul_bias<<<grid, threads>>>(d_act_wide, mlp2, d_act, mlp_bias2, N_compute, Dim, 4*Dim, N_tokens);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_act, Dim, N);
     cudaDeviceSynchronize();
 
     // Residual connection
-    // printf("Residual connection\n");
     add<<<N_compute, block_size_linear>>>(d_act, d_input, Dim);
     cudaCheckErrors("kernel launch failure");
     // isnan_test<<<1, 1>>>(d_input, Dim, N);
@@ -568,7 +128,7 @@ int MHA(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK[num_head
     }
   
 
-int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK[num_heads], float *d_act, float *d_act_wide,
+int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK, float *d_act, float *d_act_wide,
       float *linear[N_Layers][4], float *bias[N_Layers][4], float *ln[N_Layers][4], float *mlp1[N_Layers],
       float *mlp_bias1[N_Layers], float *mlp2[N_Layers], float *mlp_bias2[N_Layers], float *ln_final[2],
       float *proj_linear, float *d_output, int Dim, int N, int N_tokens, float *h_output, 
@@ -613,62 +173,84 @@ int Transformer(float *d_input, float *d_Q, float *d_K, float *d_V, float *d_QK[
 
       }
 
-int read_weight(float *arr, char *filename, int rows, int cols){
-
-  // printf("Reading %s\n", filename);
+// struct GPT2Weights{
   
-  FILE *file = fopen(filename, "rb");
-  if (file == NULL) {
-      printf("Error opening file\n");
-      return 1;
-  }
-
-  fread(arr, sizeof(float), rows * cols, file);
-  fclose(file);
-
-  return 0;
-  
-}
-
+//       float *h_input;
+//       float *h_output;
+//       float ***h_linear;
+//       float ***h_bias;
+//       float ***h_ln;
+//       float **h_mlp1;
+//       float **h_mlp_bias1;
+//       float **h_mlp2;
+//       float **h_mlp_bias2;
+//       float *h_final_ln[2];
+//       float *h_proj_linear;
+//       float *h_ans;
+//       float *h_pos; 
+//       float  *h_emb;
+// };
 
 int main(){
 
-
+    printf("Running \n");
     clock_t t0, t1;
     double t1sum=0.0;
     t0 = clock();
-
     int N = 2048;
 
-    int N_tokens =  9;
-    int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101}; // 257
+    // Test generation
+    int N_tokens =  59;
+    int num_new_tokens = 10;
+    // Expected generation 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314
+    printf("Expected generation \n 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314 \n");
+    int text[N_tokens] = {15496,    11,   616,  1438,   318,  1757,    13,   314,  1101, 257, 6260, 11,
+                          290, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260,
+                          13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260,
+                          13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260, 13, 314, 1101, 257, 6260,
+                          13, 314}; 
 
+    // // Test max generation time
     // int N_tokens =  2016;
     // int text[N_tokens];
+    // int num_new_tokens = 32;
     // for(int i = 0; i < N_tokens; i++) text[i] = rand() %(Vocab_OG + 1);
 
     int N_compute = ((N_tokens + 32 - 1)/32)*32;
 
-    float *h_input, *h_output, *h_linear[N_Layers][4], *h_bias[N_Layers][4], *h_ln[N_Layers][4],
-           *h_mlp1[N_Layers], *h_mlp_bias1[N_Layers], *h_mlp2[N_Layers], *h_mlp_bias2[N_Layers],
-           *h_final_ln[2], *h_proj_linear, *h_ans, *h_pos, *h_emb;
-
-    float *d_input, *d_output, *d_Q, *d_K, *d_QK[num_heads], *d_V, *d_ACT, *d_ACT_wide, *d_linear[N_Layers][4], 
+    float *d_input, *d_output, *d_Q, *d_K, *d_QK, *d_V, *d_ACT, *d_ACT_wide, *d_linear[N_Layers][4], 
       *d_bias[N_Layers][4], *d_ln[N_Layers][4], *d_mlp1[N_Layers],  *d_mlp_bias1[N_Layers],
       *d_mlp2[N_Layers], *d_mlp_bias2[N_Layers], *d_final_ln[2],  *d_proj_linear, *d_act2, *d_emb,
       *d_pos, *d_input2;
-    
+      
     int *d_max_idx;
+
+    float *h_input, *h_output, ***h_linear, ***h_bias, ***h_ln,
+           **h_mlp1, **h_mlp_bias1, **h_mlp2, **h_mlp_bias2,
+           *h_final_ln[2], *h_proj_linear, *h_ans, *h_pos, *h_emb;
+
 
     h_input = new float[N*Dim];
     h_output = new float[N*Vocab];
     h_ans = new float[N*Vocab];
     h_pos = new float[N*Dim];
     h_emb = new float[Dim*Vocab_OG];
+    h_linear = new float **[N_Layers];
+    h_bias = new float **[N_Layers];
+    h_ln = new float **[N_Layers];
+    h_mlp1 = new float *[N_Layers];
+    h_mlp_bias1 = new float *[N_Layers];
+    h_mlp2 = new float *[N_Layers];
+    h_mlp_bias2 = new float *[N_Layers];
 
     for (int i = 0; i < N_Layers; i++){
 
+      h_linear[i] = new float *[4];
+      h_bias[i] = new float *[4];
+      h_ln[i] = new float *[4];
+
       for (int j = 0; j < 4; j++){
+
         h_linear[i][j] = new float[Dim*Dim];
         h_bias[i][j] = new float[Dim];
         h_ln[i][j] = new float[Dim];
@@ -688,76 +270,16 @@ int main(){
 
     for (int i = 0; i < N*Dim; i++) h_input[i] = 0;
 
-    // initialize matrix in host memory
-    char filename[256];
-
-    snprintf(filename, sizeof(filename), "gpt_weights/wpe.weight.bin");
-    read_weight(h_pos, filename, N, Dim);
-
-    snprintf(filename, sizeof(filename), "gpt_weights/wte.weight.bin");
-    read_weight(h_emb, filename, Vocab_OG, Dim);
+    read_gpt_weights(Dim, N,  Vocab_OG,  N_tokens,  N_Layers, h_input, h_linear, h_bias,
+                    h_ln, h_mlp1, h_mlp_bias1, h_mlp2, h_mlp_bias2, h_final_ln, 
+                    h_proj_linear, h_ans, h_pos, h_emb, h_proj_linear_og);
+    
 
     for (int i = 0; i < N_tokens; i++){
       for (int j = 0; j < Dim; j++){
         h_input[i*Dim + j] = h_emb[text[i]*Dim + j] + h_pos[i*Dim + j];
       }
     }
-
-    for (int i = 0; i < N_Layers; i++){
-
-      for(int j = 0; j < 2; j++){
-        snprintf(filename, sizeof(filename), "gpt_weights/h.%d.ln_%d.weight.bin", i, j+1);
-        read_weight(h_ln[i][j*2], filename, Dim, 1);
-        snprintf(filename, sizeof(filename), "gpt_weights/h.%d.ln_%d.bias.bin", i, j+1);
-        read_weight(h_ln[i][j*2+1], filename, Dim, 1);
-      }
- 
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.attn.c_attn.weight.q.bin", i);
-      read_weight(h_linear[i][0], filename, Dim, Dim);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.attn.c_attn.weight.k.bin", i);
-      read_weight(h_linear[i][1], filename, Dim, Dim);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.attn.c_attn.weight.v.bin", i);
-      read_weight(h_linear[i][2], filename, Dim, Dim);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.attn.c_proj.weight.bin", i);
-      read_weight(h_linear[i][3], filename, Dim, Dim);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.attn.c_attn.bias.q.bin", i);
-      read_weight(h_bias[i][0], filename, Dim, 1);
-      
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.attn.c_attn.bias.k.bin", i);
-      read_weight(h_bias[i][1], filename, Dim, 1);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.attn.c_attn.bias.v.bin", i);
-      read_weight(h_bias[i][2], filename, Dim, 1);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.attn.c_proj.bias.bin", i);
-      read_weight(h_bias[i][3], filename, Dim, 1);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.mlp.c_fc.weight.bin", i);
-      read_weight(h_mlp1[i], filename, Dim*4*Dim, 1);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.mlp.c_fc.bias.bin", i);
-      read_weight(h_mlp_bias1[i], filename, 4*Dim, 1);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.mlp.c_proj.weight.bin", i);
-      read_weight(h_mlp2[i], filename, Dim*4*Dim, 1);
-
-      snprintf(filename, sizeof(filename), "gpt_weights/h.%d.mlp.c_proj.bias.bin", i);
-      read_weight(h_mlp_bias2[i], filename, Dim, 1);
-    }
-
-
-    snprintf(filename, sizeof(filename), "gpt_weights/ln_f.weight.bin");
-    read_weight(h_final_ln[0], filename, Dim, 1);
-
-    snprintf(filename, sizeof(filename), "gpt_weights/ln_f.bias.bin");
-    read_weight(h_final_ln[1], filename, Dim, 1);
-
-    snprintf(filename, sizeof(filename), "gpt_weights/etw.weight.bin");
-    read_weight(h_proj_linear_og, filename, Dim, Vocab_OG);
 
     // copy from h_proj_linear_og to h_proj_linear
     for (int i = 0; i < Dim; i++){
@@ -766,24 +288,19 @@ int main(){
       }
     }
 
-    snprintf(filename, sizeof(filename), "gpt_weights/output.bin");
-    read_weight(h_ans, filename, N_tokens, Vocab_OG);
-
     // allocate device space
-
     cudaMalloc(&d_input, N*Dim*sizeof(float));
     cudaMalloc(&d_input2, N*Dim*sizeof(float));
     cudaMalloc(&d_output, N*Vocab*sizeof(float));
     cudaMalloc(&d_Q, N*Dim*sizeof(float));
     cudaMalloc(&d_K, N*Dim*sizeof(float));
     cudaMalloc(&d_V, N*Dim*sizeof(float));  
+    cudaMalloc(&d_QK, num_heads*N*N*sizeof(float));
     cudaMalloc(&d_ACT, N*Dim*sizeof(float));
     cudaMalloc(&d_ACT_wide, 4*N*Dim*sizeof(float));
     cudaMalloc(&d_act2, N*Dim*sizeof(float));
     cudaMalloc(&d_emb, Dim*Vocab_OG*sizeof(float));
     cudaMalloc(&d_pos, N*Dim*sizeof(float));
-
-    for(int i = 0; i < num_heads; i++) cudaMalloc(&d_QK[i], N*N*sizeof(float));
 
     for (int i = 0; i < N_Layers; i++){
 
@@ -874,16 +391,18 @@ int main(){
       cudaDeviceSynchronize();
 
       N_tokens++;
-      N_compute = ((N_tokens + 32 - 1)/32)*32;
+      N_compute = ((N_tokens + block_size - 1)/block_size)*block_size;
+      if(z == 0) printf("N compute tokens = %d \n", N_compute);
 
       // Initialization timing
       t1sum = ((double)(clock() - t0))/CLOCKS_PER_SEC;
       // printf("Time per token = %f seconds\n", t1sum);
-      printf("%d, %f second\n ", *new_token, t1sum);
+      // printf("%d, %f second\n ", *new_token, t1sum);
+      printf("%d, ", *new_token);
 
     }
 
-    printf("Time for %d tokens = %f seconds\n", N_tokens, ((double)(clock() - t1))/CLOCKS_PER_SEC);
+    printf("\nTime for %d tokens = %f seconds\n", num_new_tokens, ((double)(clock() - t1))/CLOCKS_PER_SEC);
 
     return 0;
 
